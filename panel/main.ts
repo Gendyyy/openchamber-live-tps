@@ -213,12 +213,20 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
   }
 
   const live = rate.live.tps;
-  const streaming = rate.busy && rate.waiting === null && live > 0.05;
+  // Full strength only while the model is emitting text or reasoning. Tool
+  // arguments also land in `live.chars`, but the headline should not look
+  // live while the model itself has stopped producing.
+  const streaming = rate.busy && rate.waiting === null
+    && (rate.live.textChars > 0 || rate.live.reasoningChars > 0);
   // Headline is the running turn average: stable across network jitter and
   // identical to the finalized average when the turn ends.
   const shown = rate.running ? rate.running.tps : (rate.lastTurn?.tokensPerSecond ?? NaN);
-  bigEl.textContent = Number.isFinite(shown) && shown > 0 ? formatTps(shown) : '—';
-  bigEl.className = Number.isFinite(shown) && shown > 0 ? 'big' : 'big muted';
+  const hasValue = Number.isFinite(shown) && shown > 0;
+  bigEl.textContent = hasValue ? formatTps(shown) : '—';
+  // Grey whenever tokens are not arriving. The number stays the running or
+  // last average, but full strength made it read as a live rate while the
+  // curve was already decaying: thinking, a tool run, or a finished turn.
+  bigEl.className = hasValue ? (streaming ? 'big' : 'big stale') : 'big muted';
 
   // The curve is owned by the service: it survives panel reloads and
   // session switches, and is a rolling rate window rather than turn history.

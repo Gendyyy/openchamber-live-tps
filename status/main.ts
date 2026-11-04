@@ -254,8 +254,11 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
   // Headline is the running turn average: stable across network jitter and
   // identical to the finalized average when the turn ends.
   const shown = rate.running ? rate.running.tps : (rate.lastTurn?.tokensPerSecond ?? NaN);
-  valueEl.textContent = Number.isFinite(shown) && shown > 0 ? formatTps(shown) : '—';
-  valueEl.className = 'value';
+  const hasValue = Number.isFinite(shown) && shown > 0;
+  valueEl.textContent = hasValue ? formatTps(shown) : '—';
+  // Grey whenever tokens are not arriving, so the number does not read as a
+  // live rate next to a curve that has already decayed towards zero.
+  valueEl.className = hasValue && !streaming ? 'value stale' : 'value';
 
   // The curve is owned by the service: it survives iframe remounts and
   // session switches, and is a rolling rate window rather than turn history.
