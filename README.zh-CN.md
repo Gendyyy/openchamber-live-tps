@@ -81,7 +81,13 @@ OpenChamber server ─────────────▶ service/  （跑�
 
 两个界面都会自愈：service 重启后，它们发现 `/rate` 里 `sessionId: null` 就会重新 `/watch`，让 host 把 service 拉回来。
 
-service 还会自己探测父进程的回环端口去找 `/api/global/event`，所以 SSH 隧道连到远程 OpenChamber 也能测出真实速度，而不是 `unreachable`。
+service 在**它所在的机器上**找事件流，不再只听页面的一面之词：
+
+- 先读桌面端自己的端口（`settings.json` 里的 `desktopLocalPort`）。Private Relay 客户端正需要这一条：它把页面当作自包含的 `srcDoc` 加载，地址是 `about:srcdoc`，压根没有 http(s) origin 可以上报；
+- 页面自己有 origin 时（本机或局域网浏览器）用它；
+- 最后才探测父进程的回环端口找 `/api/global/event`，覆盖 SSH 隧道和无桌面端的安装。
+
+所以拿不到 origin 的页面照样会发 `/watch`，没有 origin 不是错误状态。
 
 ### UI 密码下怎么读事件流
 

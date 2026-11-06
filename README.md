@@ -122,9 +122,19 @@ Both guests self-heal: if the service was restarted they notice `sessionId: null
 in a `/rate` answer and re-assert `/watch`, which lets the host bring the service
 back.
 
-The service also discovers its own event-stream origin by probing the parent
-process's loopback ports for `/api/global/event`, so an SSH tunnel to a remote
-OpenChamber reports real numbers instead of `unreachable`.
+The service finds the event stream on the machine that hosts it, never from the
+page alone:
+
+- the desktop's own port (`desktopLocalPort` in `settings.json`) first — this is
+  what a Private Relay client needs, because it mounts the page as a self-
+  contained `srcDoc` whose location is `about:srcdoc`: no http(s) origin exists
+  to report;
+- the page's origin when it has one (a browser on this machine or the LAN);
+- a probe of the parent process's loopback ports for `/api/global/event`, which
+  covers SSH tunnels and headless installs.
+
+A page with no origin therefore still asks `/watch`; a missing origin is not an
+error.
 
 ### Reading the event stream behind a UI password
 

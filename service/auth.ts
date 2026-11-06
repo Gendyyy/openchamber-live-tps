@@ -24,10 +24,13 @@ const readRecord = async (file: string): Promise<Record<string, unknown>> => {
  *
  * This is the fallback for a headless install: it has no desktop-local token,
  * so the bearer in `serverHeaders()` is not available. The password is only
- * read for a loopback listener owned by our parent process, and only sent back
- * to that same origin; redirects are refused so neither credential can travel
- * anywhere else. `OPENCHAMBER_LIVE_TPS_UI_PASSWORD` supplies it explicitly when
- * the host's data directory is not visible to the service.
+ * read for a loopback listener that is either owned by our parent process or
+ * has the server's own instance file (`run/openchamber-<port>.json`) in the
+ * data directory, and only sent back to that same origin; redirects are refused
+ * so neither credential can travel anywhere else. The file is the evidence that
+ * matters on Windows, where `netstat` can leave a socket's PID unnamed and the
+ * port set comes back empty. `OPENCHAMBER_LIVE_TPS_UI_PASSWORD` supplies the
+ * password explicitly when the host's data directory is not visible.
  */
 export const passwordAuthHeaders = async (
   origin: string,
@@ -43,11 +46,15 @@ export const passwordAuthHeaders = async (
   }
   if (!isLoopbackHost(url.hostname)) return {};
   const port = Number(url.port || (url.protocol === 'https:' ? 443 : 80));
-  if (!Number.isInteger(port) || !parentPorts.has(port)) return {};
+  if (!Number.isInteger(port) || port <= 0) return {};
+
+  // The instance file is written by the server for its own port, so it is
+  // evidence the port is ours even when the scan could not name a PID.
+  const instance = await readRecord(path.join(dataDir, 'run', `openchamber-${port}.json`));
+  if (!parentPorts.has(port) && Object.keys(instance).length === 0) return {};
 
   let password = process.env.OPENCHAMBER_LIVE_TPS_UI_PASSWORD?.trim() ?? '';
   if (!password) {
-    const instance = await readRecord(path.join(dataDir, 'run', `openchamber-${port}.json`));
     const value = instance.uiPassword;
     if (typeof value === 'string') password = value;
   }

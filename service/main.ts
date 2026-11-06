@@ -75,6 +75,29 @@ const serverHeaders = (): Record<string, string> => {
   return token ? { Authorization: `Bearer ${token}` } : {};
 };
 
+/**
+ * The loopback origin of the desktop's own server, from the same settings file.
+ *
+ * A relay client hands the guest over as a self-contained `srcDoc`, so the page
+ * has no origin to report. The desktop knows the port it listens on, and this
+ * process is its child, so that port is the server beside us. Reading it beats
+ * scanning the process's listeners: on Windows the socket may belong to another
+ * token or compartment and name no PID, and headless installs have no desktop
+ * port at all, which is why discovery still runs as the last resort.
+ */
+const desktopOrigin = (): string | null => {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(dataDir(), 'settings.json'), 'utf8')) as {
+      desktopLocalPort?: unknown;
+    };
+    const port = Number(raw?.desktopLocalPort);
+    if (!Number.isInteger(port) || port <= 0 || port > 65_535) return null;
+    return `http://127.0.0.1:${port}`;
+  } catch {
+    return null;
+  }
+};
+
 const port = Number(process.env.OPENCHAMBER_SERVICE_PORT);
 const token = process.env.OPENCHAMBER_SERVICE_TOKEN ?? '';
 if (!Number.isInteger(port) || port <= 0 || !token) {
@@ -155,7 +178,13 @@ type ErrorKind = 'network' | 'http' | 'closed';
 type Sample = { at: number; chars: number; kind: 'text' | 'reasoning' | 'tool' };
 
 type WatchConfig = {
-  origin: string;
+  /**
+   * The origin the page was served from, or `null` when it has none: a relay
+   * client mounts a guest as a `srcDoc`, whose location is `about:srcdoc`
+   * with no http(s) origin to report. The service then finds the server on
+   * this machine instead of dialing the client's address.
+   */
+  origin: string | null;
   sessionId: string | null;
 };
 
@@ -1762,13 +1791,18 @@ const startStream = async (tried: ReadonlySet<string> = new Set()): Promise<void
   // The page's origin is right whenever this process runs beside the server
   // that serves it, and stops being right behind a port forward. A previously
   // discovered origin goes first so a reconnect skips the known-dead dial.
+  // The desktop's own port is next: a relay page has no origin at all, and
+  // the server it is talking to is the one this process was spawned beside.
+  const own = desktopOrigin();
   const seen = new Set(tried);
-  const candidates = [serverOrigin, current.origin].filter(
-    (origin): origin is string => origin !== null && origin.length > 0 && !seen.has(origin),
-  );
+  const candidates: string[] = [];
+  for (const candidate of [serverOrigin, current.origin, own]) {
+    if (!candidate || seen.has(candidate)) continue;
+    seen.add(candidate);
+    candidates.push(candidate);
+  }
 
   for (const origin of candidates) {
-    seen.add(origin);
     let response: Response;
     try {
       // The global stream is not directory scoped. `/api/event` silently carries
@@ -1812,6 +1846,7 @@ const startStream = async (tried: ReadonlySet<string> = new Set()): Promise<void
       await response.body?.cancel();
       continue;
     }
+    if (origin === own) serverOrigin = own;
     connection = 'live';
     retryDelay = RETRY_BASE_MS;
     lastEventAt = Date.now();
@@ -1996,10 +2031,11 @@ const isHttpOrigin = (value: string): boolean => {
  * page was relying on.
  */
 const applyWatch = (next: WatchConfig): boolean => {
-  const originChanged = watch === null || watch.origin !== next.origin;
-  // A new page origin is a new host: whatever we learned about the old one's
-  // loopback says nothing about this one.
-  if (originChanged) serverOrigin = null;
+  // This service was spawned by the server it serves, so once that server's
+  // own address is known, a page origin change only means another surface is
+  // talking (a local window and a relay client together, say): the stream must
+  // survive it. Without a known address the hint still decides.
+  const originChanged = watch === null || (serverOrigin === null && watch.origin !== next.origin);
   watch = next;
   if (next.sessionId) {
     watched.add(next.sessionId);
@@ -2059,11 +2095,21 @@ const server = http.createServer((req, res) => {
   if (url.pathname === '/watch' && req.method === 'POST') {
     void readJsonBody(req).then((raw) => {
       const body = (raw && typeof raw === 'object' ? raw : {}) as { origin?: unknown; sessionId?: unknown };
-      const origin = readString(body.origin);
-      if (!isHttpOrigin(origin)) {
+      // A relay surface has no origin to report: its document is a srcDoc and
+      // its location is `about:srcdoc`. An absent/empty origin is therefore
+      // valid, and the service finds the server on this machine itself. A
+      // value that is present still has to be a usable http(s) origin.
+      const rawOrigin = body.origin;
+      if (rawOrigin !== undefined && rawOrigin !== null && typeof rawOrigin !== 'string') {
         json(res, 400, { error: 'origin must be an http(s) origin from the OpenChamber server' });
         return;
       }
+      const hinted = (rawOrigin ?? '').trim();
+      if (hinted !== '' && !isHttpOrigin(hinted)) {
+        json(res, 400, { error: 'origin must be an http(s) origin from the OpenChamber server' });
+        return;
+      }
+      const origin = hinted === '' ? null : hinted;
       const sessionId = typeof body.sessionId === 'string' && body.sessionId.trim() ? body.sessionId : null;
       // `changed` still means "you were not already set up for this": a new
       // session counts, an origin switch counts, a repeat does not. It no

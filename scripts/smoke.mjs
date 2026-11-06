@@ -7,7 +7,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
 
 const SERVICE_TOKEN = 'smoke-test-token';
@@ -18,6 +18,11 @@ const OTHER = 'ses_other';
 // other, and so nothing lands in the repo.
 const STATE_FILE = path.join(os.tmpdir(), `live-tps-smoke-state-${process.pid}.json`);
 fs.rmSync(STATE_FILE, { force: true });
+// A data dir without a desktop port keeps discovery on the scanning path and
+// away from any real OpenChamber running on this machine.
+const SMOKE_DATA_DIR = path.join(os.tmpdir(), `live-tps-data-${process.pid}`);
+fs.mkdirSync(SMOKE_DATA_DIR, { recursive: true });
+fs.writeFileSync(path.join(SMOKE_DATA_DIR, 'settings.json'), '{}');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -52,6 +57,21 @@ const sseServer = http.createServer((req, res) => {
 await new Promise((r) => sseServer.listen(0, '127.0.0.1', r));
 const sseOrigin = `http://127.0.0.1:${sseServer.address().port}`;
 
+// Origin discovery scans the parent process's listening ports. A restricted
+// token or AppContainer can leave `netstat -ano` unable to name a PID for this
+// process's sockets, so there is nothing to find: an environment limit, not a
+// regression. Only Windows has this trap; `ss`/`lsof`/`/proc` still cover the
+// other platforms, where the scan assertions always run.
+const canScanParentListeners = (() => {
+  if (process.platform !== 'win32') return true;
+  try {
+    const out = execFileSync('netstat', ['-ano'], { encoding: 'latin1', maxBuffer: 16 * 1024 * 1024 });
+    return out.split(/\r?\n/).some((line) => line.includes(`:${sseServer.address().port}`) && line.includes('LISTENING'));
+  } catch {
+    return false;
+  }
+})();
+
 const emit = (event) => {
   const frame = `data: ${JSON.stringify(event)}\n\n`;
   for (const res of clients) res.write(frame);
@@ -66,6 +86,7 @@ const svc = spawn(process.execPath, ['service/main.js'], {
     OPENCHAMBER_SERVICE_PORT: String(svcPort),
     OPENCHAMBER_SERVICE_TOKEN: SERVICE_TOKEN,
     OPENCHAMBER_LIVE_TPS_STATE: STATE_FILE,
+    OPENCHAMBER_DATA_DIR: SMOKE_DATA_DIR,
   },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
@@ -767,23 +788,27 @@ const dead = http.createServer();
 await new Promise((resolve) => dead.listen(0, '127.0.0.1', resolve));
 const deadOrigin = `http://127.0.0.1:${dead.address().port}`;
 await new Promise((resolve) => dead.close(resolve));
-await svcFetch('/watch', { method: 'POST', body: JSON.stringify({ origin: deadOrigin, sessionId: SESSION }) });
-let rediscovered = null;
-for (let i = 0; i < 30 && (!rediscovered || rediscovered.connection !== 'live'); i += 1) {
-  await sleep(100);
-  rediscovered = await (await svcFetch('/rate')).json();
+if (canScanParentListeners) {
+  await svcFetch('/watch', { method: 'POST', body: JSON.stringify({ origin: deadOrigin, sessionId: SESSION }) });
+  let rediscovered = null;
+  for (let i = 0; i < 30 && (!rediscovered || rediscovered.connection !== 'live'); i += 1) {
+    await sleep(100);
+    rediscovered = await (await svcFetch('/rate')).json();
+  }
+  check(
+    'unreachable page origin falls back to origin discovery',
+    rediscovered?.connection === 'live',
+    JSON.stringify(rediscovered && { connection: rediscovered.connection, error: rediscovered.error, errorKind: rediscovered.errorKind }),
+  );
+  check('error kind cleared once connected', rediscovered?.errorKind === null, JSON.stringify(rediscovered?.errorKind));
+  ev('session.execution.started', { sessionID: SESSION });
+  await sleep(150);
+  const afterDiscovery = await (await svcFetch('/rate')).json();
+  check('events flow after discovery', afterDiscovery.busy === true, JSON.stringify({ busy: afterDiscovery.busy }));
+  ev('session.execution.succeeded', { sessionID: SESSION });
+} else {
+  console.log('skip origin discovery: this shell cannot name its own listening sockets (netstat shows no PID)');
 }
-check(
-  'unreachable page origin falls back to origin discovery',
-  rediscovered?.connection === 'live',
-  JSON.stringify(rediscovered && { connection: rediscovered.connection, error: rediscovered.error, errorKind: rediscovered.errorKind }),
-);
-check('error kind cleared once connected', rediscovered?.errorKind === null, JSON.stringify(rediscovered?.errorKind));
-ev('session.execution.started', { sessionID: SESSION });
-await sleep(150);
-const afterDiscovery = await (await svcFetch('/rate')).json();
-check('events flow after discovery', afterDiscovery.busy === true, JSON.stringify({ busy: afterDiscovery.busy }));
-ev('session.execution.succeeded', { sessionID: SESSION });
 
 // --- origin discovery without ss/lsof ----------------------------------------
 // Minimal containers ship neither helper. An empty PATH forces the service
@@ -856,6 +881,7 @@ const svc2 = spawn(process.execPath, ['service/main.js'], {
     OPENCHAMBER_SERVICE_PORT: String(svcPort),
     OPENCHAMBER_SERVICE_TOKEN: SERVICE_TOKEN,
     OPENCHAMBER_LIVE_TPS_STATE: STATE_FILE,
+    OPENCHAMBER_DATA_DIR: SMOKE_DATA_DIR,
   },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
@@ -971,8 +997,107 @@ check('a missing settings file still starts the service', ready4);
 svc4.kill();
 await once(svc4, 'exit');
 
+// --- relay guest: the page has no origin at all ------------------------------
+// A Private Relay client mounts a guest as a self-contained `srcDoc`, so
+// `window.location` is `about:srcdoc` and the page cannot name the server.
+// The watch must still be accepted, and the service must find the server on
+// this machine instead of rejecting the request. A fresh process proves the
+// finding is what connects it, not an origin discovered earlier.
+// The desktop writes its own listener's port into settings.json. Pointing a
+// scratch data dir at the mock keeps the run hermetic: without it a fixed
+// service would dial the real OpenChamber running on this machine.
+const relayDataDir = path.join(os.tmpdir(), `live-tps-relay-${process.pid}`);
+fs.mkdirSync(relayDataDir, { recursive: true });
+fs.writeFileSync(
+  path.join(relayDataDir, 'settings.json'),
+  JSON.stringify({ desktopLocalPort: sseServer.address().port, desktopLocalClientToken: 'oc_client_smoke' }),
+);
+const svc5 = spawn(process.execPath, ['service/main.js'], {
+  env: {
+    ...process.env,
+    OPENCHAMBER_SERVICE_PORT: String(svcPort),
+    OPENCHAMBER_SERVICE_TOKEN: SERVICE_TOKEN,
+    OPENCHAMBER_LIVE_TPS_STATE: STATE_FILE,
+    OPENCHAMBER_DATA_DIR: relayDataDir,
+  },
+  stdio: ['ignore', 'pipe', 'pipe'],
+});
+svc5.stderr.on('data', (d) => process.stderr.write(`[service5] ${d}`));
+const svc5Fetch = (p, init) => fetch(`http://127.0.0.1:${svcPort}${p}`, {
+  ...init,
+  headers: { Authorization: `Bearer ${SERVICE_TOKEN}`, ...(init?.headers ?? {}) },
+});
+let ready5 = false;
+for (let i = 0; i < 50 && !ready5; i += 1) {
+  try { ready5 = (await svc5Fetch('/health')).ok; } catch { /* not yet */ }
+  if (!ready5) await sleep(100);
+}
+check('relay: a fresh service starts', ready5);
+const postWatch = async (body) => {
+  const response = await svc5Fetch('/watch', { method: 'POST', body: JSON.stringify(body) });
+  return { status: response.status, text: await response.text() };
+};
+const nakedWatch = await postWatch({ sessionId: SESSION });
+check(
+  'relay: a watch without any origin is accepted',
+  nakedWatch.status === 200,
+  `status=${nakedWatch.status} ${nakedWatch.text}`,
+);
+let relayRate = null;
+for (let i = 0; i < 60 && (!relayRate || relayRate.connection !== 'live'); i += 1) {
+  await sleep(100);
+  relayRate = await (await svc5Fetch('/rate')).json();
+}
+check(
+  'relay: an origin-less watch finds the server on this machine',
+  relayRate?.connection === 'live',
+  JSON.stringify(relayRate && { connection: relayRate.connection, error: relayRate.error, errorKind: relayRate.errorKind }),
+);
+ev('session.execution.started', { sessionID: SESSION });
+await sleep(200);
+const relayBusy = await (await svc5Fetch('/rate')).json();
+check('relay: events flow after an origin-less watch', relayBusy.busy === true, JSON.stringify({ busy: relayBusy.busy }));
+ev('session.execution.succeeded', { sessionID: SESSION });
+
+const nullWatch = await postWatch({ origin: null, sessionId: SESSION });
+check('relay: an explicit null origin is accepted', nullWatch.status === 200, `status=${nullWatch.status} ${nullWatch.text}`);
+const emptyWatch = await postWatch({ origin: '', sessionId: SESSION });
+check('relay: an empty origin means none', emptyWatch.status === 200, `status=${emptyWatch.status} ${emptyWatch.text}`);
+for (const [label, origin] of [
+  ['a non-http scheme', 'ftp://127.0.0.1:1'],
+  ['credentials in the origin', 'http://user:pass@127.0.0.1:1'],
+  ['a value that is not an origin', 'not an origin'],
+  ['an origin that is not a string', 5],
+]) {
+  const rejected = await postWatch({ origin, sessionId: SESSION });
+  check(`relay: ${label} is still refused`, rejected.status === 400, `status=${rejected.status} ${rejected.text}`);
+}
+
+// A local window and a relay client can watch together. Once the service knows
+// the server's own address, the second surface's origin hint must not restart
+// the stream the first one is relying on.
+const flip = await postWatch({ origin: 'http://127.0.0.1:9', sessionId: SESSION });
+check(
+  'relay: a second surface does not tear the stream down',
+  flip.status === 200 && JSON.parse(flip.text).connection === 'live',
+  `status=${flip.status} ${flip.text}`,
+);
+ev('session.execution.started', { sessionID: SESSION });
+await sleep(200);
+const acrossFlip = await (await svc5Fetch('/rate')).json();
+check(
+  'relay: events keep flowing across a surface switch',
+  acrossFlip.busy === true,
+  JSON.stringify({ busy: acrossFlip.busy }),
+);
+ev('session.execution.succeeded', { sessionID: SESSION });
+svc5.kill();
+await once(svc5, 'exit');
+fs.rmSync(relayDataDir, { recursive: true, force: true });
+
 console.log(failures === 0 ? '\nALL SMOKE TESTS PASSED' : `\n${failures} FAILURES`);
 svc.kill();
 sseServer.close();
 fs.rmSync(STATE_FILE, { force: true });
+fs.rmSync(SMOKE_DATA_DIR, { recursive: true, force: true });
 process.exit(failures === 0 ? 0 : 1);

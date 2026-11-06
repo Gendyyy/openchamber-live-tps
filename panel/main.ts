@@ -56,7 +56,6 @@ const COPY = {
     waitingPermission: '等授权', waitingQuestion: '等回答',
     connecting: '连接中', reconnecting: '重连中',
     noService: '需在 设置 → 扩展 里允许本地服务',
-    noOrigin: '当前页面连不上 OpenChamber 服务',
     live: '实时', lastTurn: '上轮均值', ttft: '首字延迟',
     reasoning: '推理占比', connection: '连接', events: '事件',
     measured: '实测', estimated: '估计',
@@ -72,7 +71,6 @@ const COPY = {
     waitingPermission: 'waiting for permission', waitingQuestion: 'waiting for answer',
     connecting: 'connecting', reconnecting: 'reconnecting',
     noService: 'Allow the local service in Settings → Extensions',
-    noOrigin: 'Cannot reach the OpenChamber server from this surface',
     live: 'live', lastTurn: 'last', ttft: 'TTFT',
     reasoning: 'reasoning share', connection: 'connection', events: 'events',
     measured: 'measured', estimated: 'estimated',
@@ -290,10 +288,9 @@ const withoutSession = (rate: RateResponse): RateResponse => ({
 
 const poll = async (): Promise<void> => {
   if (stopped || polling) return;
-  if (!origin) {
-    render(null, copy.noOrigin);
-    return;
-  }
+  // No origin is not a dead end: a relay client runs this page as a `srcDoc`,
+  // where `window.location` is `about:srcdoc`. The service finds the server on
+  // the machine that hosts it, so the page still asks and shows what it gets.
   polling = true;
   try {
     const result = await host.serviceRequest({ method: 'GET', path: '/rate' });
@@ -312,14 +309,14 @@ const poll = async (): Promise<void> => {
 };
 
 const configure = async (id: string | null): Promise<void> => {
-  if (!origin) {
-    render(null, copy.noOrigin);
-    return;
-  }
-  const key = `${origin}|${id ?? ''}`;
+  const key = `${origin ?? ''}|${id ?? ''}`;
   if (key === configuredKey) return;
   try {
-    await host.serviceRequest({ method: 'POST', path: '/watch', body: JSON.stringify({ origin, sessionId: id }) });
+    await host.serviceRequest({
+      method: 'POST',
+      path: '/watch',
+      body: JSON.stringify(origin ? { origin, sessionId: id } : { sessionId: id }),
+    });
     configuredKey = key;
   } catch (error) {
     configuredKey = '';

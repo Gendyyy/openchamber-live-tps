@@ -37,11 +37,13 @@ var passwordAuthHeaders = async (origin, dataDir, parentPorts, signal) => {
   if (!isLoopbackHost(url.hostname))
     return {};
   const port = Number(url.port || (url.protocol === "https:" ? 443 : 80));
-  if (!Number.isInteger(port) || !parentPorts.has(port))
+  if (!Number.isInteger(port) || port <= 0)
+    return {};
+  const instance = await readRecord(path.join(dataDir, "run", `openchamber-${port}.json`));
+  if (!parentPorts.has(port) && Object.keys(instance).length === 0)
     return {};
   let password = process.env.OPENCHAMBER_LIVE_TPS_UI_PASSWORD?.trim() ?? "";
   if (!password) {
-    const instance = await readRecord(path.join(dataDir, "run", `openchamber-${port}.json`));
     const value = instance.uiPassword;
     if (typeof value === "string")
       password = value;
@@ -87,6 +89,17 @@ var readClientToken = () => {
 var serverHeaders = () => {
   const token = readClientToken();
   return token ? { Authorization: `Bearer ${token}` } : {};
+};
+var desktopOrigin = () => {
+  try {
+    const raw = JSON.parse(fs2.readFileSync(path2.join(dataDir(), "settings.json"), "utf8"));
+    const port = Number(raw?.desktopLocalPort);
+    if (!Number.isInteger(port) || port <= 0 || port > 65535)
+      return null;
+    return `http://127.0.0.1:${port}`;
+  } catch {
+    return null;
+  }
 };
 var port = Number(process.env.OPENCHAMBER_SERVICE_PORT);
 var token = process.env.OPENCHAMBER_SERVICE_TOKEN ?? "";
@@ -1316,10 +1329,16 @@ var startStream = async (tried = new Set) => {
   connection = "connecting";
   lastError = null;
   lastErrorKind = null;
+  const own = desktopOrigin();
   const seen = new Set(tried);
-  const candidates = [serverOrigin, current.origin].filter((origin) => origin !== null && origin.length > 0 && !seen.has(origin));
+  const candidates = [];
+  for (const candidate of [serverOrigin, current.origin, own]) {
+    if (!candidate || seen.has(candidate))
+      continue;
+    seen.add(candidate);
+    candidates.push(candidate);
+  }
   for (const origin of candidates) {
-    seen.add(origin);
     let response;
     try {
       response = await fetch(new URL("/api/global/event", origin), {
@@ -1356,6 +1375,8 @@ var startStream = async (tried = new Set) => {
       await response.body?.cancel();
       continue;
     }
+    if (origin === own)
+      serverOrigin = own;
     connection = "live";
     retryDelay = RETRY_BASE_MS;
     lastEventAt = Date.now();
@@ -1477,9 +1498,7 @@ var isHttpOrigin = (value) => {
   }
 };
 var applyWatch = (next) => {
-  const originChanged = watch === null || watch.origin !== next.origin;
-  if (originChanged)
-    serverOrigin = null;
+  const originChanged = watch === null || serverOrigin === null && watch.origin !== next.origin;
   watch = next;
   if (next.sessionId) {
     watched.add(next.sessionId);
@@ -1534,11 +1553,17 @@ var server = http.createServer((req, res) => {
   if (url.pathname === "/watch" && req.method === "POST") {
     readJsonBody(req).then((raw) => {
       const body = raw && typeof raw === "object" ? raw : {};
-      const origin = readString(body.origin);
-      if (!isHttpOrigin(origin)) {
+      const rawOrigin = body.origin;
+      if (rawOrigin !== undefined && rawOrigin !== null && typeof rawOrigin !== "string") {
         json(res, 400, { error: "origin must be an http(s) origin from the OpenChamber server" });
         return;
       }
+      const hinted = (rawOrigin ?? "").trim();
+      if (hinted !== "" && !isHttpOrigin(hinted)) {
+        json(res, 400, { error: "origin must be an http(s) origin from the OpenChamber server" });
+        return;
+      }
+      const origin = hinted === "" ? null : hinted;
       const sessionId = typeof body.sessionId === "string" && body.sessionId.trim() ? body.sessionId : null;
       const fresh = sessionId !== null && !watched.has(sessionId);
       const changed = applyWatch({ origin, sessionId }) || fresh;

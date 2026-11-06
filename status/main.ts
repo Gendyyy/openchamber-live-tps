@@ -58,7 +58,6 @@ const COPY = {
     connecting: '连接中',
     reconnecting: '重连中',
     noService: '需在 设置 → 扩展 里允许本地服务',
-    noOrigin: '当前页面连不上 OpenChamber 服务',
     unreachable: '连不上服务端事件流',
     noData: '对话开始后显示',
     lastTurn: '上轮',
@@ -76,7 +75,6 @@ const COPY = {
     connecting: 'connecting',
     reconnecting: 'reconnecting',
     noService: 'Allow the local service in Settings → Extensions',
-    noOrigin: 'Cannot reach the OpenChamber server from this surface',
     unreachable: 'cannot reach the server stream',
     noData: 'shows once a turn runs',
     lastTurn: 'last',
@@ -317,10 +315,9 @@ const withoutSession = (rate: RateResponse): RateResponse => ({
 
 const poll = async (): Promise<void> => {
   if (stopped || polling) return;
-  if (!origin) {
-    render(null, copy.noOrigin);
-    return;
-  }
+  // No origin is not a dead end: a relay client runs this page as a `srcDoc`,
+  // where `window.location` is `about:srcdoc`. The service finds the server on
+  // the machine that hosts it, so the page still asks and shows what it gets.
   polling = true;
   try {
     // Name the session so a page and a service holding different sessions
@@ -359,18 +356,14 @@ const poll = async (): Promise<void> => {
 };
 
 const configure = async (sessionId: string | null): Promise<void> => {
-  if (!origin) {
-    render(null, copy.noOrigin);
-    return;
-  }
-  const key = `${origin}|${sessionId ?? ''}`;
+  const key = `${origin ?? ''}|${sessionId ?? ''}`;
   if (key === configuredKey || configuring) return;
   configuring = true;
   try {
     await host.serviceRequest({
       method: 'POST',
       path: '/watch',
-      body: JSON.stringify({ origin, sessionId }),
+      body: JSON.stringify(origin ? { origin, sessionId } : { sessionId }),
     });
     configuredKey = key;
   } catch (error) {
